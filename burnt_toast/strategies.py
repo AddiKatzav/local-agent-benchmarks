@@ -279,8 +279,6 @@ class NoGuardStrategy(BaseStrategy):
 
     def run(self, haystack_context: str) -> AgentRunResult:
         ctx = self._make_context(haystack_context)
-        if self.mode == "needle":
-            return run_agent_loop(ctx, self.name)
         return run_agent_loop(ctx, self.name)
 
 

@@ -20,6 +20,7 @@ def needle_in_visible_window(
     actual_context_tokens: int,
     effective_prompt_tokens: int,
     chars_per_token: float = 4.0,
+    overhead_tokens: int = 120,
     truncation_threshold: float = 0.95,
 ) -> bool:
     """
@@ -34,7 +35,7 @@ def needle_in_visible_window(
     if effective_prompt_tokens >= actual_context_tokens * truncation_threshold:
         return True
 
-    visible_chars = estimate_visible_chars(effective_prompt_tokens, chars_per_token)
+    visible_chars = estimate_visible_chars(effective_prompt_tokens, chars_per_token, overhead_tokens)
     needle_index = haystack.find(secret_phrase)
     if needle_index < 0:
         return False

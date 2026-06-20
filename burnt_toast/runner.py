@@ -31,11 +31,36 @@ from burnt_toast.metrics import (
     validate_output,
 )
 from burnt_toast.ollama_client import OllamaClient
-from burnt_toast.prompts import is_context_truncated, needle_in_visible_window
+from burnt_toast.prompts import build_initial_messages, is_context_truncated, needle_in_visible_window
 from burnt_toast.secrets import generate_run_secret
 from burnt_toast.strategies import get_strategy
 
 logger = logging.getLogger(__name__)
+
+_overhead_cache: dict[tuple[str, str], int] = {}
+
+
+def measure_prompt_overhead_tokens(client: OllamaClient, model: str, mode: ExperimentMode) -> int:
+    """
+    Measure non-haystack wrapper token overhead (system + user prose) for
+    (model, mode), via the same plain-text count_tokens() path used for
+    actual_context_tokens -- true apples-to-apples vs. a hardcoded guess.
+
+    NOTE: still undercounts by the chat-template special/role-marker tokens
+    Ollama's /api/chat adds when actually rendering `messages`, because
+    count_tokens() tokenizes plain text (/api/tokenize or /api/generate),
+    never the /api/chat-rendered form. No Ollama endpoint exposes a dry-run
+    chat token count without a real generation call, so this residual is
+    accepted and documented rather than chased.
+    """
+    cache_key = (model, mode)
+    if cache_key in _overhead_cache:
+        return _overhead_cache[cache_key]
+    messages = build_initial_messages(mode, "")
+    wrapper_text = "\n".join(m["content"] for m in messages)
+    overhead = client.count_tokens(model, wrapper_text)
+    _overhead_cache[cache_key] = overhead
+    return overhead
 
 
 def generate_run_matrix(
@@ -169,7 +194,10 @@ def run_single(
             metrics.context_truncated = False
             metrics.needle_in_window = False
         else:
-            metrics.context_truncated = is_context_truncated(actual_tokens, effective)
+            overhead_tokens = measure_prompt_overhead_tokens(client, config.model, config.experiment_mode)
+            metrics.context_truncated = is_context_truncated(
+                actual_tokens, effective, overhead_tokens=overhead_tokens
+            )
             metrics.needle_in_window = needle_in_visible_window(
                 haystack,
                 secret_phrase=run_secret.phrase,
@@ -177,6 +205,7 @@ def run_single(
                 actual_context_tokens=actual_tokens,
                 effective_prompt_tokens=effective,
                 chars_per_token=chars_per_token,
+                overhead_tokens=overhead_tokens,
             )
             metrics.context_visibility = (
                 "visible" if metrics.needle_in_window else "truncated"

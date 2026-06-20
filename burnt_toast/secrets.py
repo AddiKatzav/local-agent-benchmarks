@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 
+from burnt_toast._hashing import stable_seed
+
 # Shown to the model in system/user prompts and nudges — schema only, no answer.
 JSON_RESPONSE_SCHEMA: str = '{"secret_code": <integer>}'
 
@@ -36,8 +38,11 @@ def generate_run_secret(
     """
     Derive a deterministic 4-digit secret for this matrix cell.
 
-    Re-running the same configuration reproduces the same code; each run index
-    within the matrix gets a distinct value.
+    Re-running the same configuration reproduces the same code -- including
+    across separate process invocations -- since this uses stable_seed()
+    rather than builtin hash(), which is randomized per process unless
+    PYTHONHASHSEED is fixed. Each run index within the matrix gets a
+    distinct value.
     """
     key = (
         master_seed,
@@ -48,7 +53,7 @@ def generate_run_secret(
         strategy,
         experiment_mode,
     )
-    rng = random.Random(hash(key) & 0xFFFFFFFF)
+    rng = random.Random(stable_seed(*key))
     code = rng.randint(1000, 9999)
     phrase = NEEDLE_PHRASE_TEMPLATE.format(code=code)
     return RunSecret(code=code, phrase=phrase)

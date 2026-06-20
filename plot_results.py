@@ -64,6 +64,19 @@ def load_results(csv_path: Path) -> pd.DataFrame:
     return df
 
 
+def split_valid_failed(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split into (valid_rows, failed_rows) based on non-empty error_message.
+
+    Failed/timed-out runs keep all-zero/false numeric fields (ttft_seconds,
+    accuracy, etc.) alongside a populated error_message -- averaging them
+    into plotted curves silently skews TTFT/accuracy-vs-context-size exactly
+    at the high-context cells most likely to fail. Excluded rows are not
+    dropped from the CSV itself, only from what gets plotted.
+    """
+    is_failed = df["error_message"].fillna("").astype(str).str.strip() != ""
+    return df[~is_failed].copy(), df[is_failed].copy()
+
+
 def _title_parts(df: pd.DataFrame, csv_path: Path) -> str:
     models = ", ".join(sorted(df["model"].dropna().unique()))
     hw = ", ".join(sorted(df["hardware_env"].dropna().unique()))
@@ -158,7 +171,23 @@ def main(argv: list[str] | None = None) -> int:
         if df.empty:
             print(f"Error: no data rows in {csv_path}", file=sys.stderr)
             return 1
-        plot_results(df, csv_path, output_path)
+
+        valid_df, failed_df = split_valid_failed(df)
+        if not failed_df.empty:
+            print(
+                f"Excluding {len(failed_df)} failed/errored run(s) from plot "
+                f"(of {len(df)} total):",
+                file=sys.stderr,
+            )
+            summary = failed_df.groupby(["model", "context_size_tokens", "strategy"]).size()
+            for (model, ctx, strategy), n in summary.items():
+                print(f"  model={model} ctx={int(ctx)} strategy={strategy}: {n} failed", file=sys.stderr)
+
+        if valid_df.empty:
+            print(f"Error: no successful rows left to plot in {csv_path}", file=sys.stderr)
+            return 1
+
+        plot_results(valid_df, csv_path, output_path)
     except (FileNotFoundError, ValueError, KeyError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

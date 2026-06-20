@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import random
 import textwrap
 from pathlib import Path
 
+from burnt_toast._hashing import stable_seed
 from burnt_toast.config import FILLER_CORPUS_PATH
 from burnt_toast.ollama_client import OllamaClient
 
@@ -192,9 +192,7 @@ def haystack_seed(
     KV-cache prefix reuse from corrupting cross-cell TTFT/throughput and the
     context_truncated/needle_in_window heuristics.
     """
-    key = "\x1f".join([model, str(target_tokens), needle_position, strategy, experiment_mode])
-    digest = hashlib.sha256(key.encode()).hexdigest()
-    return int(digest, 16) % (2**32)
+    return stable_seed(model, target_tokens, needle_position, strategy, experiment_mode)
 
 
 def build_haystack(

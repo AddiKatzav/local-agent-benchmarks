@@ -9,12 +9,16 @@ Four independent tiers:
      process, not the harness/system (fix #2).
   4. Live haystack-divergence check -- proves different matrix cells build
      different filler text, defeating Ollama's prompt-cache reuse (fix #1).
-  5. No-regression smoke check -- runs `python -m burnt_toast --quick` end to
+  5. Live overhead-measurement check -- proves the truncation/needle-window
+     heuristics use a real measured wrapper-text token count instead of the
+     old hardcoded overhead_tokens=120 guess (fix #5).
+  6. No-regression smoke check -- runs `python -m burnt_toast --quick` end to
      end for both modes and validates CSV row shape. This is a regression
-     check only -- it does NOT prove either fix on its own (a buggy
-     MemoryTracker can still produce a "successful," nonzero-but-wrong row).
+     check only -- it does NOT prove any of the live-tier fixes on its own
+     (e.g. a buggy MemoryTracker can still produce a "successful," nonzero-
+     but-wrong row).
 
-Tiers 3-5 are skipped (not failed) when Ollama is unreachable, so this script
+Tiers 3-6 are skipped (not failed) when Ollama is unreachable, so this script
 stays usable later when Ollama may not be running.
 """
 
@@ -36,6 +40,7 @@ from burnt_toast.config import MODELS, OLLAMA_BASE_URL  # noqa: E402
 from burnt_toast.context import build_haystack, haystack_seed  # noqa: E402
 from burnt_toast.metrics import CSV_COLUMNS, MemoryTracker  # noqa: E402
 from burnt_toast.ollama_client import OllamaClient  # noqa: E402
+from burnt_toast.runner import measure_prompt_overhead_tokens  # noqa: E402
 
 
 class Result:
@@ -135,6 +140,37 @@ def check_haystack_divergence_live(client: OllamaClient) -> Result:
     )
 
 
+def check_overhead_measurement_live(client: OllamaClient) -> Result:
+    model = MODELS[0]
+
+    needle_overhead = measure_prompt_overhead_tokens(client, model, "needle")
+    needle_overhead_again = measure_prompt_overhead_tokens(client, model, "needle")
+    burnt_toast_overhead = measure_prompt_overhead_tokens(client, model, "burnt-toast")
+
+    if needle_overhead <= 0 or burnt_toast_overhead <= 0:
+        return Result(
+            "live overhead measurement",
+            "FAIL",
+            f"needle_overhead={needle_overhead} burnt_toast_overhead={burnt_toast_overhead} "
+            "-- expected a positive measured token count for both modes",
+        )
+
+    if needle_overhead != needle_overhead_again:
+        return Result(
+            "live overhead measurement",
+            "FAIL",
+            f"repeated measurement for the same (model, mode) was not stable: "
+            f"{needle_overhead} vs {needle_overhead_again} -- caching may be broken",
+        )
+
+    return Result(
+        "live overhead measurement",
+        "PASS",
+        f"needle_overhead={needle_overhead} burnt_toast_overhead={burnt_toast_overhead} tokens "
+        f"(measured from real wrapper text, not the old hardcoded 120 guess)",
+    )
+
+
 def run_smoke_benchmark() -> Result:
     failures: list[str] = []
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -188,10 +224,12 @@ def main() -> int:
         reason = f"Ollama unreachable at {OLLAMA_BASE_URL}"
         results.append(Result("live memory tracker", "SKIP", reason))
         results.append(Result("live haystack divergence", "SKIP", reason))
+        results.append(Result("live overhead measurement", "SKIP", reason))
         results.append(Result("no-regression smoke check", "SKIP", reason))
     else:
         results.append(check_memory_tracker_live())
         results.append(check_haystack_divergence_live(client))
+        results.append(check_overhead_measurement_live(client))
         results.append(run_smoke_benchmark())
 
     print("\n" + "=" * 72)

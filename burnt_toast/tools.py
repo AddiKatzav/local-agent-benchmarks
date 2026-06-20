@@ -96,6 +96,36 @@ class PythonGuard:
         self.guard_message = ""
 
 
+def _find_balanced_json_object(text: str, key_hint: str) -> str | None:
+    """
+    Find the smallest (innermost) balanced {...} substring in text whose
+    content contains key_hint (e.g. '"tool"'), scanning brace depth so
+    nested objects don't break matching. Prefers the innermost match so a
+    hint nested inside a wrapper object (e.g. {"result": {"secret_code": 1}})
+    still resolves to the specific object that actually contains it, while a
+    sibling nested object (e.g. a tool call's "arguments" sub-object) that
+    does NOT contain the hint is correctly excluded in favor of the outer one.
+    """
+    candidates: list[str] = []
+    for start, ch in enumerate(text):
+        if ch != "{":
+            continue
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    if key_hint in candidate:
+                        candidates.append(candidate)
+                    break
+    if not candidates:
+        return None
+    return min(candidates, key=len)
+
+
 def parse_tool_call(text: str) -> ToolCall | None:
     """
     Extract a tool call from model output.
@@ -127,10 +157,10 @@ def parse_tool_call(text: str) -> ToolCall | None:
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     candidates = [fenced.group(1)] if fenced else []
 
-    # Bare JSON object with "tool" key
-    bare = re.search(r"\{[^{}]*\"tool\"[^{}]*\}", text, re.DOTALL)
+    # Bare JSON object with "tool" key (handles a nested "arguments" object)
+    bare = _find_balanced_json_object(text, '"tool"')
     if bare:
-        candidates.append(bare.group(0))
+        candidates.append(bare)
 
     for candidate in candidates:
         try:
@@ -151,19 +181,14 @@ def parse_final_answer(text: str) -> dict[str, Any] | None:
     """Extract a JSON object containing secret_code from model output."""
     import re
 
-    # Direct JSON object
-    patterns = [
-        r"\{[^{}]*\"secret_code\"[^{}]*\}",
-        r"\{[^{}]*'secret_code'[^{}]*\}",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            snippet = match.group(0)
-            try:
-                return json.loads(snippet.replace("'", '"'))
-            except json.JSONDecodeError:
-                pass
+    # Direct JSON object (handles a secret_code nested one level inside a
+    # wrapper object, e.g. a weaker model emitting {"result": {...}})
+    candidate = _find_balanced_json_object(text, "secret_code")
+    if candidate:
+        try:
+            return json.loads(candidate.replace("'", '"'))
+        except json.JSONDecodeError:
+            pass
 
     # Fenced JSON
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
