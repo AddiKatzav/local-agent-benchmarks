@@ -11,22 +11,28 @@ from pathlib import Path
 from burnt_toast.config import (
     CONTEXT_SIZES_TOKENS,
     CRITIC_MODEL,
+    DEFAULT_EXPERIMENT_MODE,
     HARDWARE_ENV,
     MODELS,
     NEEDLE_POSITIONS,
     RESULTS_CSV,
     STRATEGIES,
+    ExperimentMode,
     RunConfig,
+    compute_num_ctx,
 )
-from burnt_toast.context import build_haystack
+from burnt_toast.context import build_haystack, haystack_seed
 from burnt_toast.metrics import (
     MemoryTracker,
     ResultsWriter,
     RunMetrics,
     make_run_id,
+    unique_results_path,
     validate_output,
 )
 from burnt_toast.ollama_client import OllamaClient
+from burnt_toast.prompts import is_context_truncated, needle_in_visible_window
+from burnt_toast.secrets import generate_run_secret
 from burnt_toast.strategies import get_strategy
 
 logger = logging.getLogger(__name__)
@@ -38,6 +44,7 @@ def generate_run_matrix(
     needle_positions: list[str] | None = None,
     strategies: list[str] | None = None,
     hardware_env: str | None = None,
+    experiment_mode: ExperimentMode | None = None,
 ) -> list[RunConfig]:
     """Build the full cartesian product of experimental variables."""
     models = models or MODELS
@@ -45,6 +52,7 @@ def generate_run_matrix(
     needle_positions = needle_positions or NEEDLE_POSITIONS
     strategies = strategies or STRATEGIES
     hardware_env = hardware_env or HARDWARE_ENV
+    experiment_mode = experiment_mode or DEFAULT_EXPERIMENT_MODE
 
     configs: list[RunConfig] = []
     for idx, (model, ctx, needle, strategy) in enumerate(
@@ -56,6 +64,7 @@ def generate_run_matrix(
                 context_size_tokens=ctx,
                 needle_position=needle,  # type: ignore[arg-type]
                 strategy=strategy,  # type: ignore[arg-type]
+                experiment_mode=experiment_mode,
                 hardware_env=hardware_env,
                 run_index=idx,
             )
@@ -79,32 +88,49 @@ def run_single(
         config.run_index,
     )
     timestamp = datetime.now(timezone.utc).isoformat()
+    num_ctx = compute_num_ctx(config.context_size_tokens)
+    run_secret = generate_run_secret(
+        run_index=config.run_index,
+        model=config.model,
+        context_size_tokens=config.context_size_tokens,
+        needle_position=config.needle_position,
+        strategy=config.strategy,
+        experiment_mode=config.experiment_mode,
+    )
 
     logger.info("=" * 72)
     logger.info(
-        "START run=%s | model=%s | ctx=%d | needle=%s | strategy=%s | hw=%s",
+        "START run=%s | mode=%s | model=%s | ctx=%d | num_ctx=%d | "
+        "needle=%s | strategy=%s | hw=%s | expected_code=%d",
         run_id,
+        config.experiment_mode,
         config.model,
         config.context_size_tokens,
+        num_ctx,
         config.needle_position,
         config.strategy,
         config.hardware_env,
+        run_secret.code,
     )
 
     metrics = RunMetrics(
         timestamp=timestamp,
         run_id=run_id,
+        experiment_mode=config.experiment_mode,
         hardware_env=config.hardware_env,
         model=config.model,
         context_size_tokens=config.context_size_tokens,
         actual_context_tokens=0,
+        num_ctx=num_ctx,
         needle_position=config.needle_position,
         strategy=config.strategy,
+        expected_secret_code=run_secret.code,
     )
 
     memory_tracker = MemoryTracker()
     memory_tracker.start()
     t0 = time.perf_counter()
+    haystack = ""
 
     try:
         haystack, actual_tokens = build_haystack(
@@ -112,6 +138,14 @@ def run_single(
             config.model,
             config.context_size_tokens,
             config.needle_position,
+            secret_phrase=run_secret.phrase,
+            seed=haystack_seed(
+                config.model,
+                config.context_size_tokens,
+                config.needle_position,
+                config.strategy,
+                config.experiment_mode,
+            ),
         )
         metrics.actual_context_tokens = actual_tokens
         logger.info("Haystack built: %d tokens (target %d)", actual_tokens, config.context_size_tokens)
@@ -120,11 +154,49 @@ def run_single(
             config.strategy,
             client,
             config.model,
+            mode=config.experiment_mode,
+            num_ctx=num_ctx,
             critic_model=critic_model,
+            run_secret=run_secret,
         )
         agent_result = strategy.run(haystack)
 
+        effective = agent_result.effective_prompt_tokens
+        chars_per_token = client._chars_per_token  # noqa: SLF001 — calibrated during build
+        metrics.effective_prompt_tokens = effective
+        if config.experiment_mode == "burnt-toast":
+            metrics.context_visibility = "external"
+            metrics.context_truncated = False
+            metrics.needle_in_window = False
+        else:
+            metrics.context_truncated = is_context_truncated(actual_tokens, effective)
+            metrics.needle_in_window = needle_in_visible_window(
+                haystack,
+                secret_phrase=run_secret.phrase,
+                needle_position=config.needle_position,
+                actual_context_tokens=actual_tokens,
+                effective_prompt_tokens=effective,
+                chars_per_token=chars_per_token,
+            )
+            metrics.context_visibility = (
+                "visible" if metrics.needle_in_window else "truncated"
+            )
+
+        if config.experiment_mode != "burnt-toast" and metrics.context_truncated:
+            logger.warning(
+                "Context truncation detected: built=%d effective_prompt=%d num_ctx=%d",
+                actual_tokens,
+                effective,
+                num_ctx,
+            )
+        if config.experiment_mode != "burnt-toast" and not metrics.needle_in_window:
+            logger.warning(
+                "Needle likely outside model window (position=%s)",
+                config.needle_position,
+            )
+
         metrics.total_iterations = agent_result.iterations
+        metrics.tool_call_count = agent_result.tool_call_count
         metrics.guard_triggered = agent_result.guard_triggered
         metrics.ttft_seconds = round(agent_result.mean_ttft, 6)
         if agent_result.mean_tokens_per_second is not None:
@@ -134,7 +206,10 @@ def run_single(
         metrics.raw_output_snippet = agent_result.final_output[:500]
         metrics.error_message = agent_result.error_message
 
-        json_valid, accuracy, extracted = validate_output(agent_result.final_output)
+        json_valid, accuracy, extracted = validate_output(
+            agent_result.final_output,
+            run_secret.code,
+        )
         metrics.json_valid = json_valid
         metrics.accuracy = accuracy
         metrics.extracted_secret_code = extracted
@@ -150,8 +225,8 @@ def run_single(
 
     logger.info(
         "DONE  run=%s | elapsed=%.1fs | ttft=%.3fs | tps=%s | "
-        "accuracy=%s | json_valid=%s | iterations=%d | guard=%s | "
-        "peak_rss=%.1fMB",
+        "accuracy=%s | json_valid=%s | iterations=%d | tool_calls=%d | "
+        "guard=%s | truncated=%s | needle_visible=%s | peak_rss=%.1fMB",
         run_id,
         elapsed,
         metrics.ttft_seconds,
@@ -159,12 +234,29 @@ def run_single(
         metrics.accuracy,
         metrics.json_valid,
         metrics.total_iterations,
+        metrics.tool_call_count,
         metrics.guard_triggered,
+        metrics.context_truncated,
+        metrics.needle_in_window,
         metrics.peak_rss_mb,
     )
 
     writer.append(metrics)
     return metrics
+
+
+def resolve_results_path(
+    results_path: str | Path | None,
+    *,
+    unique_suffix: bool = True,
+) -> Path:
+    """Resolve output CSV path, optionally appending uuid + timestamp."""
+    base = Path(results_path) if results_path else RESULTS_CSV
+    if unique_suffix:
+        resolved = unique_results_path(base)
+        logger.info("Results file: %s", resolved)
+        return resolved
+    return base
 
 
 def run_benchmark(
@@ -174,16 +266,20 @@ def run_benchmark(
     needle_positions: list[str] | None = None,
     strategies: list[str] | None = None,
     hardware_env: str | None = None,
+    experiment_mode: ExperimentMode | None = None,
     ollama_base_url: str | None = None,
     results_path: str | None = None,
+    unique_suffix: bool = True,
     dry_run: bool = False,
-) -> list[RunMetrics]:
+) -> tuple[list[RunMetrics], Path | None]:
     """
     Run the complete benchmark matrix (or a filtered subset).
 
-    Returns a list of RunMetrics for all completed runs.
+    Returns (metrics, output_csv_path).
     """
     from burnt_toast.config import OLLAMA_BASE_URL
+
+    mode = experiment_mode or DEFAULT_EXPERIMENT_MODE
 
     configs = generate_run_matrix(
         models=models,
@@ -191,20 +287,22 @@ def run_benchmark(
         needle_positions=needle_positions,
         strategies=strategies,
         hardware_env=hardware_env,
+        experiment_mode=mode,
     )
 
-    logger.info("Benchmark matrix: %d total runs", len(configs))
+    logger.info("Benchmark matrix: %d total runs | mode=%s", len(configs), mode)
 
     if dry_run:
         for cfg in configs:
             logger.info(
-                "  [dry-run] %s | ctx=%d | needle=%s | strategy=%s",
+                "  [dry-run] %s | mode=%s | ctx=%d | needle=%s | strategy=%s",
                 cfg.model,
+                cfg.experiment_mode,
                 cfg.context_size_tokens,
                 cfg.needle_position,
                 cfg.strategy,
             )
-        return []
+        return [], None
 
     base_url = ollama_base_url or OLLAMA_BASE_URL
     client = OllamaClient(base_url)
@@ -218,17 +316,16 @@ def run_benchmark(
     requested_models = sorted({cfg.model for cfg in configs})
     if "Critic" in {cfg.strategy for cfg in configs}:
         requested_models = sorted(set(requested_models) | {CRITIC_MODEL})
-    resolved = client.validate_models(requested_models)
+    client.validate_models(requested_models)
     logger.info("Ollama models available: %s", client.list_models())
-    logger.info("Resolved benchmark models: %s", resolved)
 
-    # Map requested config names to resolved Ollama names
     available = client.list_models()
     model_map = {
         m: client.resolve_model(m, available) or m for m in requested_models
     }
 
-    writer = ResultsWriter(Path(results_path) if results_path else RESULTS_CSV)
+    output_path = resolve_results_path(results_path, unique_suffix=unique_suffix)
+    writer = ResultsWriter(output_path)
     all_metrics: list[RunMetrics] = []
 
     for i, config in enumerate(configs, 1):
@@ -245,4 +342,4 @@ def run_benchmark(
         all_metrics.append(metrics)
 
     logger.info("Benchmark complete. Results saved to %s", writer.path)
-    return all_metrics
+    return all_metrics, writer.path

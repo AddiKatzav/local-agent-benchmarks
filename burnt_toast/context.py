@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import random
 import textwrap
 from pathlib import Path
 
-from burnt_toast.config import FILLER_CORPUS_PATH, SECRET_PHRASE
+from burnt_toast.config import FILLER_CORPUS_PATH
 from burnt_toast.ollama_client import OllamaClient
 
 logger = logging.getLogger(__name__)
@@ -174,13 +175,35 @@ def _pad_to_token_budget(
     return current
 
 
+def haystack_seed(
+    model: str,
+    target_tokens: int,
+    needle_position: str,
+    strategy: str,
+    experiment_mode: str,
+) -> int:
+    """Deterministic, reproducible filler-text seed for one matrix cell.
+
+    Uses sha256 (not builtin hash(), which is randomized per process) so that
+    rerunning the same matrix cell — even in a different process, days later —
+    builds byte-identical haystack text (desirable for comparing runs), while
+    two DIFFERENT cells (different model/context/position/strategy/mode) get
+    independent filler text. This independence is what prevents Ollama's
+    KV-cache prefix reuse from corrupting cross-cell TTFT/throughput and the
+    context_truncated/needle_in_window heuristics.
+    """
+    key = "\x1f".join([model, str(target_tokens), needle_position, strategy, experiment_mode])
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    return int(digest, 16) % (2**32)
+
+
 def build_haystack(
     client: OllamaClient,
     model: str,
     target_tokens: int,
     needle_position: str,
     *,
-    secret_phrase: str = SECRET_PHRASE,
+    secret_phrase: str,
     seed: int = 42,
 ) -> tuple[str, int]:
     """
