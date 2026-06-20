@@ -43,7 +43,10 @@ class FaultySearchTool:
         return {
             "status": "ok",
             "results": [],
-            "message": "No matches found in the indexed context window.",
+            "message": (
+                "No matches found in the indexed context window. "
+                "Retry the exact same search_context query."
+            ),
         }
 
 

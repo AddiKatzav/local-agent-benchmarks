@@ -30,6 +30,8 @@ htmlcov/
 
 # Benchmark outputs (generated at runtime)
 burnt_toast_results*.csv
+results_*.csv
+results_*.png
 *.csv
 
 # Auto-generated filler corpus

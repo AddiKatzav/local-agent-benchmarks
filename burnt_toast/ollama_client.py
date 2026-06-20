@@ -200,13 +200,18 @@ class OllamaClient:
         *,
         stream: bool = True,
         temperature: float = 0.1,
+        num_ctx: int | None = None,
     ) -> OllamaResponse:
         """Send a chat completion request and collect timing metrics."""
+        options: dict[str, Any] = {"temperature": temperature}
+        if num_ctx is not None:
+            options["num_ctx"] = num_ctx
+
         payload = {
             "model": model,
             "messages": messages,
             "stream": stream,
-            "options": {"temperature": temperature},
+            "options": options,
         }
 
         if not stream:

@@ -2,44 +2,31 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from burnt_toast.config import (
+    BURNT_TOAST_REQUIRE_TOOL_EVIDENCE,
     CRITIC_MODEL,
-    EXPECTED_JSON,
     MAX_AGENT_ITERATIONS,
     PYTHON_GUARD_MAX_IDENTICAL_CALLS,
+    ExperimentMode,
 )
 from burnt_toast.ollama_client import OllamaClient, OllamaResponse
+from burnt_toast.prompts import build_initial_messages
+from burnt_toast.secrets import JSON_RESPONSE_SCHEMA, RunSecret
 from burnt_toast.tools import (
     FaultySearchTool,
     PythonGuard,
-    ToolCall,
     parse_final_answer,
     parse_tool_call,
 )
 
 logger = logging.getLogger(__name__)
-
-SYSTEM_PROMPT = """\
-You are an autonomous research agent. Your task is to locate a hidden secret code \
-within the provided context document and report it in strict JSON format.
-
-You have access to one tool:
-  - search_context(query: string) — searches the context for matching text.
-
-To call a tool, respond EXACTLY in this format:
-  TOOL: search_context {"query": "your search terms"}
-
-When you have found the secret code, respond with ONLY this JSON (no other text):
-  {"secret_code": <integer>}
-
-The secret code is a 4-digit integer hidden somewhere in the context.
-Do not guess — search the context thoroughly before answering.
-"""
 
 CRITIC_SYSTEM_PROMPT = """\
 You are a loop-detection critic. Given a transcript of an agent's recent actions,
@@ -62,22 +49,24 @@ class AgentRunResult:
 
     final_output: str
     iterations: int
+    tool_call_count: int = 0
     guard_triggered: bool = False
     responses: list[OllamaResponse] = field(default_factory=list)
     transcript: list[str] = field(default_factory=list)
     error_message: str = ""
 
     @property
-    def aggregated_ttft(self) -> float:
+    def effective_prompt_tokens(self) -> int:
+        """Prompt tokens from the first turn (main context load)."""
         if not self.responses:
-            return 0.0
-        return sum(r.ttft_seconds for r in self.responses)
+            return 0
+        return self.responses[0].prompt_eval_count
 
     @property
     def mean_ttft(self) -> float:
         if not self.responses:
             return 0.0
-        return self.aggregated_ttft / len(self.responses)
+        return sum(r.ttft_seconds for r in self.responses) / len(self.responses)
 
     @property
     def total_prompt_tokens(self) -> int:
@@ -95,15 +84,188 @@ class AgentRunResult:
         return sum(tps_values) / len(tps_values)
 
 
+@dataclass
+class LoopContext:
+    """Shared state for the agent loop across strategies."""
+
+    client: OllamaClient
+    model: str
+    mode: ExperimentMode
+    num_ctx: int
+    haystack_context: str
+    messages: list[dict[str, str]]
+    json_schema: str = JSON_RESPONSE_SCHEMA
+    search_tool: FaultySearchTool = field(default_factory=FaultySearchTool)
+    tool_call_count: int = 0
+    tool_evidence_found: bool = False
+    transcript: list[str] = field(default_factory=list)
+    responses: list[OllamaResponse] = field(default_factory=list)
+
+    def chat(self) -> OllamaResponse:
+        response = self.client.chat(self.model, self.messages, num_ctx=self.num_ctx)
+        self.responses.append(response)
+        return response
+
+    def record_tool_call(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.tool_call_count += 1
+        result = self.search_tool.invoke(arguments)
+        if result.get("results"):
+            self.tool_evidence_found = True
+        return result
+
+    def nudge_need_tool(self) -> str:
+        return (
+            "You MUST call exactly: TOOL: search_context {\"query\": \"secret agent code\"}. "
+            "The document is external and not visible to you directly."
+        )
+
+    def nudge_need_answer(self) -> str:
+        if self.mode == "burnt-toast":
+            return (
+                "No retrieved evidence is available. Do not guess. Retry exactly: "
+                "TOOL: search_context {\"query\": \"secret agent code\"}"
+            )
+        return f"Read the context document and respond with JSON: {self.json_schema}"
+
+
+def _accept_final_answer(ctx: LoopContext, answer: dict[str, Any] | None) -> bool:
+    if answer is None:
+        return False
+    if (
+        ctx.mode == "burnt-toast"
+        and BURNT_TOAST_REQUIRE_TOOL_EVIDENCE
+        and not ctx.tool_evidence_found
+    ):
+        return False
+    return True
+
+
+def _handle_tool_path(
+    ctx: LoopContext,
+    content: str,
+    tool_call,
+    *,
+    on_before_tool: Callable[[Any], bool] | None = None,
+) -> str | None:
+    """
+    Process a tool call. Returns 'guard_stop' if the guard halted the loop,
+    or None to continue normally.
+    """
+    if on_before_tool is not None and not on_before_tool(tool_call):
+        return "guard_stop"
+
+    tool_result = ctx.record_tool_call(tool_call.arguments)
+    tool_msg = (
+        f"TOOL RESULT ({ctx.search_tool.name}): "
+        f"{tool_result['message']} — results: {tool_result['results']}"
+    )
+    ctx.transcript.append(tool_msg)
+    ctx.messages.append({"role": "assistant", "content": content})
+    ctx.messages.append({"role": "user", "content": tool_msg})
+    return None
+
+
+def run_agent_loop(
+    ctx: LoopContext,
+    strategy_name: str,
+    *,
+    on_before_tool: Callable[[Any], bool] | None = None,
+    after_tool: Callable[[LoopContext], bool] | None = None,
+    on_guard_stop: Callable[[LoopContext, str], AgentRunResult] | None = None,
+) -> AgentRunResult:
+    """Shared multi-turn loop used by all strategies."""
+    result = AgentRunResult(final_output="", iterations=0)
+    content = ""
+
+    for iteration in range(1, MAX_AGENT_ITERATIONS + 1):
+        logger.info("[%s] iteration %d", strategy_name, iteration)
+        response = ctx.chat()
+        content = response.content.strip()
+        ctx.transcript.append(f"ASSISTANT: {content}")
+        result.iterations = iteration
+
+        answer = parse_final_answer(content)
+        if _accept_final_answer(ctx, answer):
+            result.final_output = content
+            result.tool_call_count = ctx.tool_call_count
+            result.responses = ctx.responses
+            result.transcript = ctx.transcript
+            return result
+
+        if answer is not None and ctx.mode == "burnt-toast" and ctx.tool_call_count == 0:
+            nudge = ctx.nudge_need_tool()
+            ctx.transcript.append(f"SYSTEM: {nudge}")
+            ctx.messages.append({"role": "assistant", "content": content})
+            ctx.messages.append({"role": "user", "content": nudge})
+            continue
+
+        tool_call = parse_tool_call(content)
+        if tool_call and tool_call.name == ctx.search_tool.name:
+            if ctx.mode == "needle":
+                nudge = (
+                    "No tools are available in this task. Read the context document "
+                    f"directly and respond with JSON: {ctx.json_schema}"
+                )
+                ctx.transcript.append(f"SYSTEM: {nudge}")
+                ctx.messages.append({"role": "assistant", "content": content})
+                ctx.messages.append({"role": "user", "content": nudge})
+                continue
+
+            guard_outcome = _handle_tool_path(ctx, content, tool_call, on_before_tool=on_before_tool)
+            if guard_outcome == "guard_stop" and on_guard_stop is not None:
+                return on_guard_stop(ctx, content)
+
+            if after_tool is not None and after_tool(ctx):
+                if on_guard_stop is not None:
+                    return on_guard_stop(ctx, content)
+            continue
+
+        if ctx.mode == "needle":
+            nudge = ctx.nudge_need_answer()
+        else:
+            nudge = ctx.nudge_need_answer()
+        ctx.transcript.append(f"SYSTEM: {nudge}")
+        ctx.messages.append({"role": "assistant", "content": content})
+        ctx.messages.append({"role": "user", "content": nudge})
+
+    result.final_output = content
+    result.tool_call_count = ctx.tool_call_count
+    result.responses = ctx.responses
+    result.transcript = ctx.transcript
+    result.error_message = f"Max iterations ({MAX_AGENT_ITERATIONS}) reached"
+    return result
+
+
 class BaseStrategy(ABC):
     """Abstract agent loop strategy."""
 
     name: str
 
-    def __init__(self, client: OllamaClient, model: str) -> None:
+    def __init__(
+        self,
+        client: OllamaClient,
+        model: str,
+        *,
+        mode: ExperimentMode = "needle",
+        num_ctx: int = 4096,
+        run_secret: RunSecret | None = None,
+    ) -> None:
         self.client = client
         self.model = model
-        self.search_tool = FaultySearchTool()
+        self.mode = mode
+        self.num_ctx = num_ctx
+        self.run_secret = run_secret
+
+    def _make_context(self, haystack_context: str) -> LoopContext:
+        return LoopContext(
+            client=self.client,
+            model=self.model,
+            mode=self.mode,
+            num_ctx=self.num_ctx,
+            haystack_context=haystack_context,
+            json_schema=self.run_secret.json_schema if self.run_secret else JSON_RESPONSE_SCHEMA,
+            messages=build_initial_messages(self.mode, haystack_context),
+        )
 
     @abstractmethod
     def run(self, haystack_context: str) -> AgentRunResult:
@@ -111,168 +273,73 @@ class BaseStrategy(ABC):
 
 
 class NoGuardStrategy(BaseStrategy):
-    """
-    Pure agent loop with no loop protection.
-
-    The faulty search tool keeps returning empty results, encouraging repetition
-    (the 'burnt toast' effect).
-    """
+    """Pure agent loop with no loop protection."""
 
     name = "No-Guard"
 
     def run(self, haystack_context: str) -> AgentRunResult:
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"CONTEXT DOCUMENT ({len(haystack_context)} chars):\n\n"
-                    f"{haystack_context}\n\n"
-                    f"Find the secret code and output {EXPECTED_JSON}"
-                ),
-            },
-        ]
-
-        result = AgentRunResult(final_output="", iterations=0)
-        transcript: list[str] = []
-
-        for iteration in range(1, MAX_AGENT_ITERATIONS + 1):
-            logger.info("[%s] iteration %d", self.name, iteration)
-            response = self.client.chat(self.model, messages)
-            result.responses.append(response)
-            content = response.content.strip()
-            transcript.append(f"ASSISTANT: {content}")
-            result.iterations = iteration
-
-            # Check for final JSON answer
-            answer = parse_final_answer(content)
-            if answer is not None:
-                result.final_output = content
-                result.transcript = transcript
-                return result
-
-            # Check for tool call
-            tool_call = parse_tool_call(content)
-            if tool_call and tool_call.name == self.search_tool.name:
-                tool_result = self.search_tool.invoke(tool_call.arguments)
-                tool_msg = (
-                    f"TOOL RESULT ({self.search_tool.name}): "
-                    f"{tool_result['message']} — results: {tool_result['results']}"
-                )
-                transcript.append(tool_msg)
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": tool_msg})
-                continue
-
-            # Unparseable response — nudge the agent
-            nudge = (
-                "Please either call TOOL: search_context {\"query\": \"...\"} "
-                f"or respond with JSON: {EXPECTED_JSON}"
-            )
-            transcript.append(f"SYSTEM: {nudge}")
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": nudge})
-
-        result.final_output = content if result.responses else ""
-        result.transcript = transcript
-        result.error_message = f"Max iterations ({MAX_AGENT_ITERATIONS}) reached"
-        return result
+        ctx = self._make_context(haystack_context)
+        if self.mode == "needle":
+            return run_agent_loop(ctx, self.name)
+        return run_agent_loop(ctx, self.name)
 
 
 class PythonGuardStrategy(BaseStrategy):
-    """
-    Agent loop with deterministic hash-based loop guard.
-
-    After 3 identical tool calls, inject a system error and force final answer.
-    """
+    """Deterministic hash-based loop guard."""
 
     name = "Python-Guard"
 
     def run(self, haystack_context: str) -> AgentRunResult:
         guard = PythonGuard(max_identical=PYTHON_GUARD_MAX_IDENTICAL_CALLS)
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"CONTEXT DOCUMENT ({len(haystack_context)} chars):\n\n"
-                    f"{haystack_context}\n\n"
-                    f"Find the secret code and output {EXPECTED_JSON}"
-                ),
-            },
-        ]
+        ctx = self._make_context(haystack_context)
 
-        result = AgentRunResult(final_output="", iterations=0)
-        transcript: list[str] = []
+        def on_before_tool(tool_call) -> bool:
+            return guard.record_and_check(tool_call)
 
-        for iteration in range(1, MAX_AGENT_ITERATIONS + 1):
-            logger.info("[%s] iteration %d", self.name, iteration)
-            response = self.client.chat(self.model, messages)
-            result.responses.append(response)
-            content = response.content.strip()
-            transcript.append(f"ASSISTANT: {content}")
-            result.iterations = iteration
+        def on_guard_stop(loop_ctx: LoopContext, content: str) -> AgentRunResult:
+            guard_msg = guard.guard_message
+            loop_ctx.transcript.append(f"SYSTEM: {guard_msg}")
+            loop_ctx.messages.append({"role": "assistant", "content": content})
+            loop_ctx.messages.append({"role": "user", "content": guard_msg})
 
-            answer = parse_final_answer(content)
-            if answer is not None:
-                result.final_output = content
-                result.transcript = transcript
-                result.guard_triggered = guard.guard_triggered
-                return result
-
-            tool_call = parse_tool_call(content)
-            if tool_call and tool_call.name == self.search_tool.name:
-                if not guard.record_and_check(tool_call):
-                    result.guard_triggered = True
-                    guard_msg = guard.guard_message
-                    transcript.append(f"SYSTEM: {guard_msg}")
-                    messages.append({"role": "assistant", "content": content})
-                    messages.append({"role": "user", "content": guard_msg})
-
-                    # One final generation after guard injection
-                    final_resp = self.client.chat(self.model, messages)
-                    result.responses.append(final_resp)
-                    result.final_output = final_resp.content.strip()
-                    transcript.append(f"ASSISTANT (post-guard): {result.final_output}")
-                    result.transcript = transcript
-                    return result
-
-                tool_result = self.search_tool.invoke(tool_call.arguments)
-                tool_msg = (
-                    f"TOOL RESULT ({self.search_tool.name}): "
-                    f"{tool_result['message']} — results: {tool_result['results']}"
-                )
-                transcript.append(tool_msg)
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": tool_msg})
-                continue
-
-            nudge = (
-                "Please either call TOOL: search_context {\"query\": \"...\"} "
-                f"or respond with JSON: {EXPECTED_JSON}"
+            final_resp = loop_ctx.chat()
+            final_output = final_resp.content.strip()
+            loop_ctx.transcript.append(f"ASSISTANT (post-guard): {final_output}")
+            return AgentRunResult(
+                final_output=final_output,
+                iterations=len(loop_ctx.responses),
+                tool_call_count=loop_ctx.tool_call_count + 1,
+                guard_triggered=True,
+                responses=loop_ctx.responses,
+                transcript=loop_ctx.transcript,
             )
-            transcript.append(f"SYSTEM: {nudge}")
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": nudge})
 
-        result.final_output = content if result.responses else ""
-        result.transcript = transcript
+        result = run_agent_loop(
+            ctx,
+            self.name,
+            on_before_tool=on_before_tool,
+            on_guard_stop=on_guard_stop,
+        )
         result.guard_triggered = guard.guard_triggered
-        result.error_message = f"Max iterations ({MAX_AGENT_ITERATIONS}) reached"
         return result
 
 
 class CriticStrategy(BaseStrategy):
-    """
-    Agent loop with a secondary critic model that detects logical looping.
-
-    Uses a fast/small model to evaluate recent transcript for repetitive patterns.
-    """
+    """Secondary LLM critic for loop detection."""
 
     name = "Critic"
 
-    def __init__(self, client: OllamaClient, model: str, critic_model: str = CRITIC_MODEL) -> None:
-        super().__init__(client, model)
+    def __init__(
+        self,
+        client: OllamaClient,
+        model: str,
+        *,
+        mode: ExperimentMode = "needle",
+        num_ctx: int = 4096,
+        critic_model: str = CRITIC_MODEL,
+        run_secret: RunSecret | None = None,
+    ) -> None:
+        super().__init__(client, model, mode=mode, num_ctx=num_ctx, run_secret=run_secret)
         self.critic_model = critic_model
 
     def _detect_loop(self, transcript: list[str]) -> bool:
@@ -286,10 +353,7 @@ class CriticStrategy(BaseStrategy):
         ]
 
         try:
-            response = self.client.chat(self.critic_model, messages, stream=False)
-            import json
-            import re
-
+            response = self.client.chat(self.critic_model, messages, stream=False, num_ctx=4096)
             text = response.content.strip()
             match = re.search(r"\{.*\}", text, re.DOTALL)
             if match:
@@ -301,77 +365,41 @@ class CriticStrategy(BaseStrategy):
         return False
 
     def run(self, haystack_context: str) -> AgentRunResult:
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"CONTEXT DOCUMENT ({len(haystack_context)} chars):\n\n"
-                    f"{haystack_context}\n\n"
-                    f"Find the secret code and output {EXPECTED_JSON}"
-                ),
-            },
-        ]
+        ctx = self._make_context(haystack_context)
 
-        result = AgentRunResult(final_output="", iterations=0)
-        transcript: list[str] = []
+        def after_tool(loop_ctx: LoopContext) -> bool:
+            return self._detect_loop(loop_ctx.transcript)
 
-        for iteration in range(1, MAX_AGENT_ITERATIONS + 1):
-            logger.info("[%s] iteration %d", self.name, iteration)
-            response = self.client.chat(self.model, messages)
-            result.responses.append(response)
-            content = response.content.strip()
-            transcript.append(f"ASSISTANT: {content}")
-            result.iterations = iteration
-
-            answer = parse_final_answer(content)
-            if answer is not None:
-                result.final_output = content
-                result.transcript = transcript
-                return result
-
-            tool_call = parse_tool_call(content)
-            if tool_call and tool_call.name == self.search_tool.name:
-                tool_result = self.search_tool.invoke(tool_call.arguments)
-                tool_msg = (
-                    f"TOOL RESULT ({self.search_tool.name}): "
-                    f"{tool_result['message']} — results: {tool_result['results']}"
+        def on_guard_stop(loop_ctx: LoopContext, content: str) -> AgentRunResult:
+            schema = loop_ctx.json_schema
+            if self.mode == "burnt-toast":
+                loop_msg = (
+                    "CRITIC ALERT: Repetitive loop detected. Stop calling tools and "
+                    f"provide your best-effort JSON answer using schema: {schema}"
                 )
-                transcript.append(tool_msg)
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": tool_msg})
+            else:
+                loop_msg = (
+                    "CRITIC ALERT: Repetitive loop detected. Stop calling tools and "
+                    "re-read the context document directly for the secret phrase. "
+                    f"Respond with JSON: {schema}"
+                )
+            logger.warning("Critic detected loop")
+            loop_ctx.transcript.append(f"SYSTEM: {loop_msg}")
+            loop_ctx.messages.append({"role": "user", "content": loop_msg})
 
-                if self._detect_loop(transcript):
-                    result.guard_triggered = True
-                    loop_msg = (
-                        "CRITIC ALERT: Repetitive loop detected. Stop calling tools and "
-                        "re-read the context document directly for the secret phrase. "
-                        f"Respond with JSON: {EXPECTED_JSON}"
-                    )
-                    logger.warning("Critic detected loop at iteration %d", iteration)
-                    transcript.append(f"SYSTEM: {loop_msg}")
-                    messages.append({"role": "user", "content": loop_msg})
-
-                    final_resp = self.client.chat(self.model, messages)
-                    result.responses.append(final_resp)
-                    result.final_output = final_resp.content.strip()
-                    transcript.append(f"ASSISTANT (post-critic): {result.final_output}")
-                    result.transcript = transcript
-                    return result
-                continue
-
-            nudge = (
-                "Please either call TOOL: search_context {\"query\": \"...\"} "
-                f"or respond with JSON: {EXPECTED_JSON}"
+            final_resp = loop_ctx.chat()
+            final_output = final_resp.content.strip()
+            loop_ctx.transcript.append(f"ASSISTANT (post-critic): {final_output}")
+            return AgentRunResult(
+                final_output=final_output,
+                iterations=len(loop_ctx.responses),
+                tool_call_count=loop_ctx.tool_call_count,
+                guard_triggered=True,
+                responses=loop_ctx.responses,
+                transcript=loop_ctx.transcript,
             )
-            transcript.append(f"SYSTEM: {nudge}")
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": nudge})
 
-        result.final_output = content if result.responses else ""
-        result.transcript = transcript
-        result.error_message = f"Max iterations ({MAX_AGENT_ITERATIONS}) reached"
-        return result
+        return run_agent_loop(ctx, self.name, after_tool=after_tool, on_guard_stop=on_guard_stop)
 
 
 def get_strategy(
@@ -379,7 +407,10 @@ def get_strategy(
     client: OllamaClient,
     model: str,
     *,
+    mode: ExperimentMode = "needle",
+    num_ctx: int = 4096,
     critic_model: str | None = None,
+    run_secret: RunSecret | None = None,
 ) -> BaseStrategy:
     """Factory for strategy instances."""
     strategies: dict[str, type[BaseStrategy]] = {
@@ -391,5 +422,12 @@ def get_strategy(
     if cls is None:
         raise ValueError(f"Unknown strategy: {name}")
     if cls is CriticStrategy:
-        return cls(client, model, critic_model=critic_model or CRITIC_MODEL)
-    return cls(client, model)
+        return cls(
+            client,
+            model,
+            mode=mode,
+            num_ctx=num_ctx,
+            critic_model=critic_model or CRITIC_MODEL,
+            run_secret=run_secret,
+        )
+    return cls(client, model, mode=mode, num_ctx=num_ctx, run_secret=run_secret)

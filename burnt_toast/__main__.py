@@ -9,6 +9,7 @@ import sys
 from burnt_toast import __version__
 from burnt_toast.config import (
     CONTEXT_SIZES_TOKENS,
+    DEFAULT_EXPERIMENT_MODE,
     HARDWARE_ENV,
     MODELS,
     NEEDLE_POSITIONS,
@@ -40,6 +41,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     parser.add_argument(
+        "--mode",
+        choices=["needle", "burnt-toast"],
+        default=DEFAULT_EXPERIMENT_MODE,
+        help=(
+            "Experiment arm: 'needle' = full context retrieval test; "
+            "'burnt-toast' = mandatory broken tool loop test (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--hardware-env",
         default=HARDWARE_ENV,
         help=f"Hardware environment label (default: {HARDWARE_ENV})",
@@ -52,7 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--results",
         default=str(RESULTS_CSV),
-        help=f"Output CSV path (default: {RESULTS_CSV})",
+        help=f"Base output CSV path; a uuid+timestamp suffix is appended (default: {RESULTS_CSV})",
+    )
+    parser.add_argument(
+        "--no-unique-suffix",
+        action="store_true",
+        help="Write to the exact --results path without uuid/timestamp suffix",
     )
     parser.add_argument(
         "--models",
@@ -116,16 +131,20 @@ def main(argv: list[str] | None = None) -> int:
         needle_positions = ["middle"]
 
     try:
-        run_benchmark(
+        _, output_path = run_benchmark(
             models=models,
             context_sizes=context_sizes,
             needle_positions=needle_positions,
             strategies=strategies,
+            experiment_mode=args.mode,
             hardware_env=args.hardware_env,
             ollama_base_url=args.ollama_url,
             results_path=args.results,
+            unique_suffix=not args.no_unique_suffix,
             dry_run=args.dry_run,
         )
+        if output_path is not None:
+            logging.info("Output: %s", output_path)
     except (ConnectionError, RuntimeError) as exc:
         logging.error("%s", exc)
         return 1
