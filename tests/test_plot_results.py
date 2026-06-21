@@ -11,50 +11,68 @@ import pandas as pd
 from plot_results import load_results, split_valid_failed
 
 
-def _make_df(error_messages: list) -> pd.DataFrame:
-    n = len(error_messages)
-    return pd.DataFrame(
-        {
-            "model": ["qwen2.5:1.5b"] * n,
-            "context_size_tokens": [1000] * n,
-            "strategy": ["No-Guard"] * n,
-            "ttft_seconds": [0.0] * n,
-            "error_message": error_messages,
-        }
-    )
+def _make_df(rows: list[dict]) -> pd.DataFrame:
+    defaults = {
+        "model": "qwen2.5:1.5b",
+        "context_size_tokens": 1000,
+        "strategy": "No-Guard",
+        "ttft_seconds": 0.0,
+        "total_iterations": 1,
+        "error_message": "",
+    }
+    return pd.DataFrame([{**defaults, **row} for row in rows])
 
 
 class TestSplitValidFailed(unittest.TestCase):
-    def test_empty_string_is_valid(self) -> None:
-        df = _make_df(["", "", ""])
+    def test_successful_run_with_no_error_message_is_valid(self) -> None:
+        df = _make_df([{"total_iterations": 1, "error_message": ""}])
         valid, failed = split_valid_failed(df)
-        self.assertEqual(len(valid), 3)
+        self.assertEqual(len(valid), 1)
         self.assertEqual(len(failed), 0)
 
-    def test_nan_is_valid(self) -> None:
-        # pd.read_csv produces NaN, not "", for an empty CSV cell -- both
-        # must count as "no error" or every successful real-CSV row would
-        # be misclassified as failed.
-        df = _make_df([float("nan"), float("nan")])
+    def test_true_crash_with_zero_iterations_is_failed(self) -> None:
+        # A genuine exception (HTTP timeout, connection error) is caught
+        # before the agent loop returns anything -- total_iterations stays
+        # at its dataclass default of 0, alongside the populated error_message.
+        df = _make_df([{
+            "total_iterations": 0,
+            "ttft_seconds": 0.0,
+            "error_message": "HTTPConnectionPool(host='localhost', port=11434): Read timed out.",
+        }])
         valid, failed = split_valid_failed(df)
-        self.assertEqual(len(valid), 2)
-        self.assertEqual(len(failed), 0)
-
-    def test_populated_error_message_is_failed(self) -> None:
-        df = _make_df(["", "Max iterations (12) reached", ""])
-        valid, failed = split_valid_failed(df)
-        self.assertEqual(len(valid), 2)
+        self.assertEqual(len(valid), 0)
         self.assertEqual(len(failed), 1)
-        self.assertEqual(failed.iloc[0]["error_message"], "Max iterations (12) reached")
 
-    def test_whitespace_only_error_message_is_treated_as_valid(self) -> None:
-        df = _make_df(["   ", ""])
+    def test_max_iterations_reached_with_real_telemetry_is_valid_not_failed(self) -> None:
+        # This is the critical case: burnt-toast mode's No-Guard strategy is
+        # EXPECTED to exhaust every iteration and populate error_message with
+        # "Max iterations (N) reached" -- but unlike a crash, total_iterations,
+        # tool_call_count, accuracy etc. are all real, fully-formed telemetry.
+        # This is the headline result the No-Guard condition exists to
+        # produce; excluding it via error_message alone would silently drop
+        # exactly that comparison from every burnt-toast plot.
+        df = _make_df([{
+            "total_iterations": 12,
+            "ttft_seconds": 1.3,
+            "error_message": "Max iterations (12) reached",
+        }])
         valid, failed = split_valid_failed(df)
-        self.assertEqual(len(valid), 2)
+        self.assertEqual(len(valid), 1)
         self.assertEqual(len(failed), 0)
 
-    def test_mixed_nan_and_empty_and_real_errors(self) -> None:
-        df = _make_df(["", float("nan"), "timed out", "HTTP error"])
+    def test_nan_total_iterations_is_treated_as_crash(self) -> None:
+        df = _make_df([{"total_iterations": float("nan"), "error_message": "some error"}])
+        valid, failed = split_valid_failed(df)
+        self.assertEqual(len(valid), 0)
+        self.assertEqual(len(failed), 1)
+
+    def test_mixed_crashes_and_completed_runs(self) -> None:
+        df = _make_df([
+            {"total_iterations": 1, "error_message": ""},
+            {"total_iterations": 0, "error_message": "Read timed out"},
+            {"total_iterations": 12, "error_message": "Max iterations (12) reached"},
+            {"total_iterations": 0, "error_message": "HTTP error"},
+        ])
         valid, failed = split_valid_failed(df)
         self.assertEqual(len(valid), 2)
         self.assertEqual(len(failed), 2)
@@ -62,7 +80,11 @@ class TestSplitValidFailed(unittest.TestCase):
     def test_end_to_end_via_real_csv_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / "results.csv"
-            df = _make_df(["", "Read timed out", ""])
+            df = _make_df([
+                {"total_iterations": 1, "error_message": ""},
+                {"total_iterations": 0, "error_message": "Read timed out"},
+                {"total_iterations": 12, "error_message": "Max iterations (12) reached"},
+            ])
             df.to_csv(csv_path, index=False)
 
             loaded = load_results(csv_path)
@@ -70,7 +92,7 @@ class TestSplitValidFailed(unittest.TestCase):
 
             self.assertEqual(len(valid_df), 2)
             self.assertEqual(len(failed_df), 1)
-            self.assertTrue((valid_df["error_message"].fillna("").astype(str).str.strip() == "").all())
+            self.assertTrue((valid_df["total_iterations"] > 0).all())
 
 
 if __name__ == "__main__":

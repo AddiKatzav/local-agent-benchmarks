@@ -65,16 +65,31 @@ def load_results(csv_path: Path) -> pd.DataFrame:
 
 
 def split_valid_failed(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split into (valid_rows, failed_rows) based on non-empty error_message.
+    """Split into (valid_rows, failed_rows) based on whether the run actually
+    produced telemetry, not merely whether error_message is populated.
 
-    Failed/timed-out runs keep all-zero/false numeric fields (ttft_seconds,
-    accuracy, etc.) alongside a populated error_message -- averaging them
-    into plotted curves silently skews TTFT/accuracy-vs-context-size exactly
-    at the high-context cells most likely to fail. Excluded rows are not
-    dropped from the CSV itself, only from what gets plotted.
+    A genuine crash (HTTP timeout, connection error, etc.) is caught in
+    run_single()'s except block BEFORE the agent loop returns, so the row
+    keeps all-zero/false numeric fields (total_iterations=0, ttft_seconds=0,
+    accuracy=False) alongside a populated error_message -- those rows must
+    be excluded, since averaging their zeros into plotted curves would skew
+    TTFT/accuracy-vs-context-size exactly at the high-context cells most
+    likely to fail.
+
+    But error_message is also set on a normal, non-exceptional return path:
+    in burnt-toast mode, No-Guard is EXPECTED to exhaust every iteration
+    ("Max iterations (N) reached") with fully valid telemetry (real
+    total_iterations, tool_call_count, accuracy) -- that is not a failure,
+    it is the headline result the No-Guard condition exists to produce.
+    Excluding it by error_message alone would silently drop exactly that
+    comparison. total_iterations > 0 is what actually distinguishes "crashed
+    before producing data" from "ran to completion (successfully or not)".
+
+    Excluded rows are not dropped from the CSV itself, only from what gets
+    plotted.
     """
-    is_failed = df["error_message"].fillna("").astype(str).str.strip() != ""
-    return df[~is_failed].copy(), df[is_failed].copy()
+    crashed = df["total_iterations"].fillna(0).astype(float) <= 0
+    return df[~crashed].copy(), df[crashed].copy()
 
 
 def _title_parts(df: pd.DataFrame, csv_path: Path) -> str:
