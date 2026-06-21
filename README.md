@@ -94,6 +94,31 @@ Ollama `num_ctx` is set to `context_size + 1024` headroom so 8K/16K runs are not
 | **`psutil`** | Peak RAM tracking during inference |
 | **`pandas` / `matplotlib`** | Results analysis and plotting |
 
+### Test Environment — `Laptop` (`results_post_fix_2026-06-21/`)
+
+Concrete specs for the hardware behind the `hardware_env=Laptop` label, for anyone (e.g.
+an article reader) trying to interpret or reproduce the absolute latency/memory numbers
+in `results_post_fix_2026-06-21/`. The `hardware_env` CSV column is metadata only — it
+doesn't change runtime behavior — so this spec lives in docs rather than the data.
+
+| Component | Spec |
+|---|---|
+| **Machine** | Dell Latitude 5421 laptop |
+| **CPU** | Intel Core i7-11850H @ 2.50GHz, 8 cores / 16 threads |
+| **RAM** | 16 GiB total (~12 GiB free at idle) |
+| **GPU** | NVIDIA GeForce MX450, 2 GB VRAM |
+| **OS** | Ubuntu 24.04.3 LTS under WSL2 (kernel `6.6.87.2-microsoft-standard-WSL2`) |
+| **Ollama** | v0.24.0 |
+| **Python** | 3.12.3 |
+
+**GPU offload was not confirmed for these runs.** The MX450's 2 GB VRAM is small
+relative to even the smallest model here (`qwen2.5:1.5b`), and no per-run GPU/CPU
+processor log was retained, so whether Ollama placed any layers on GPU vs. ran fully on
+CPU for a given model/context size is unknown. Treat all latency/throughput numbers as
+**CPU-comparable, GPU-uncertain** — don't assume this was a GPU-accelerated run. If you
+rerun this matrix, capture `ollama ps` (its `PROCESSOR` column reports `100% GPU`,
+`100% CPU`, or a split) per model immediately after each run to settle this.
+
 ### Project Layout
 
 ```
