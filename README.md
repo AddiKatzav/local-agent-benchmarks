@@ -76,6 +76,9 @@ Ollama `num_ctx` is set to `context_size + 1024` headroom so 8K/16K runs are not
 
 ### Procedure
 
+0. Validate the measurement pipeline itself (`python scripts/validate_pipeline.py` —
+   see "A note on trust" under Quick Start). Skip only if you've already validated this
+   exact checkout.
 1. Build haystack for the target context size and needle position.
 2. Run the agent loop (up to 12 iterations) with the selected guard strategy.
 3. Record metrics after each run; append incrementally to CSV.
@@ -136,29 +139,40 @@ local-agent-benchmarks/
 └── requirements.txt
 ```
 
+### Prerequisites
+
+- **Ollama must already be running** before any of the steps below (`ollama serve`, or
+  the Ollama desktop app) — the suite talks to it over HTTP at
+  `http://localhost:11434` by default (override with `--ollama-url`). Nothing in this
+  repo starts the Ollama server for you.
+- Each model needs to be pulled once before it's benchmarked (step 3 below). The default
+  matrix uses three: `qwen2.5:1.5b`, `llama3.2:3b`, `llama3.1:8b`.
+
 ### Quick Start
 
 ```bash
+# 1. Environment
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
+# 2. Confirm the benchmark's own measurement code is trustworthy before trusting any
+#    numbers it produces (46 unit tests, no Ollama needed; see "A note on trust" below)
+python -m unittest discover -s tests
+
+# 3. Pull the models the default matrix uses
 ollama pull qwen2.5:1.5b
 ollama pull llama3.2:3b
 ollama pull llama3.1:8b
 
-# Smoke test (1 run, needle mode)
+# 4. Smoke test — 1 run, needle mode, fast, just confirms the pipeline executes end-to-end
 python -m burnt_toast --quick
 
-# Needle retrieval arm (context inflation test)
+# 5. A single model, single arm, for a quick look (NOT the full matrix)
 python -m burnt_toast --mode needle --models qwen2.5:1.5b --results results_qwen.csv
-
-# Burnt-toast loop arm (guard stress test)
 python -m burnt_toast --mode burnt-toast --models qwen2.5:1.5b --results results_qwen_bt.csv
 
-# Full 90-run matrix
-python -m burnt_toast --mode needle --hardware-env Laptop
-
-# Plot results (use the suffixed filename printed at end of run)
+# 6. Plot whichever CSV you just produced (use the suffixed filename printed at the
+#    end of the run, not the literal name you passed to --results)
 python plot_results.py results_qwen_a3f2b_06_09_21_30.csv
 ```
 
@@ -167,6 +181,49 @@ Each benchmark run writes to a **uniquely suffixed CSV** by default:
 `results_qwen.csv` → `results_qwen_a3f2b_06_09_21_30.csv`
 
 Use `--no-unique-suffix` to write to the exact path given.
+
+### Reproducing the full 90-run matrix (both arms)
+
+`--models`, `--context-sizes`, `--needle-positions`, and `--strategies` all default to
+the **full** matrix (`config.py`) when omitted — you don't need to pass every value
+explicitly to get all 90 cells per mode. This is the exact pair of commands used to
+produce `results_post_fix_2026-06-21/`:
+
+```bash
+python -m burnt_toast --mode needle --hardware-env Laptop \
+    --results results_needle.csv --no-unique-suffix
+
+python -m burnt_toast --mode burnt-toast --hardware-env Laptop \
+    --results results_burnt_toast.csv --no-unique-suffix
+```
+
+Expect this to take **hours, not minutes** — `OLLAMA_TIMEOUT_SECONDS` is 600s per call,
+and on constrained hardware (see "Test Environment" above) several cells in needle mode
+will hit that timeout rather than complete quickly. On the laptop this was developed on,
+`llama3.1:8b` never completed a single needle-mode request above 4K tokens; if you see
+the same pattern after a handful of consecutive timeouts for one model at one context
+size, it's reasonable to stop early for that model rather than wait out the full 600s on
+every remaining cell — see `SESSION_SUMMARY_2026-06-21.md` for how that tradeoff was
+made the first time this matrix was run. Burnt-toast mode is much faster (well under an
+hour) since it never actually inflates the prompt.
+
+### A note on trust: validate before you believe the numbers
+
+This benchmark's own measurement code had **five bugs that silently corrupted results**
+in an earlier run (cache contamination skewing latency, memory readings attributing the
+wrong process's RAM, non-reproducible "deterministic" secret codes, crashed runs
+polluting averages, and an unmeasured constant standing in for a real one — full writeup
+in `SESSION_SUMMARY_2026-06-21.md`). Before trusting a fresh run's output:
+
+```bash
+python scripts/validate_pipeline.py
+```
+
+This runs the unit test suite plus four live checks against a running Ollama instance
+(memory tracker attribution, haystack-seed divergence, overhead measurement, and a
+`--quick` no-regression smoke test). It skips the live tiers gracefully if Ollama isn't
+reachable. There's also a reusable `.claude/skills/pipeline-sanity-check/` skill that
+wraps the same checks for future sessions.
 
 ---
 
