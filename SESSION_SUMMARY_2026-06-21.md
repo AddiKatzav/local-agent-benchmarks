@@ -1,9 +1,9 @@
-# Session summary — 2026-06-21: audit, fixes, validation, and post-fix data collection
+# Changelog — 2026-06-21: audit, fixes, validation, and post-fix data collection
 
-Context for whoever (human or Claude) analyzes `results_post_fix_2026-06-21/` next. This
-session found and fixed 5 measurement-corrupting bugs in the `burnt_toast` benchmark
-harness, validated each fix, then re-ran the experiment matrix on the fixed code. Read
-this before trusting any numbers in that directory.
+Read this before trusting any numbers in `results_post_fix_2026-06-21/`. A full,
+from-scratch read of the `burnt_toast` benchmark harness turned up 5
+measurement-corrupting bugs; each was fixed, validated, and the experiment matrix was
+re-run on the fixed code.
 
 ## TL;DR for the analyst
 
@@ -19,7 +19,7 @@ this before trusting any numbers in that directory.
 - `plot_results.py` already excludes true crashes from the rendered PNGs and prints an
   exclusion summary to stderr when it does. The PNGs in that directory reflect this.
 
-## What was wrong (original audit, before this session's fixes)
+## What was wrong (original audit, before these fixes)
 
 A from-scratch read of every file in `burnt_toast/` turned up 5 measurement-corrupting
 bugs plus 2 minor code-quality issues:
@@ -52,7 +52,7 @@ All work landed in 5 commits on `main` (newest first):
 - `4cf610e` — **Fix #4-correction**: see "A bug in the bug fix" below.
 - `d0f7a32` — **Fixes #3, #4, #5** + the two cleanups.
 - `0c1e964` — **Fixes #1, #2**.
-- `bd561e5` / `083693e` — pre-existing repo setup (not this session's work).
+- `bd561e5` / `083693e` — pre-existing repo setup, predating this audit.
 
 | # | Fix | Proof |
 |---|---|---|
@@ -79,17 +79,16 @@ by whether `error_message` was non-empty. That's wrong: `error_message` is popul
 
 The original filter would have silently dropped all 30 No-Guard rows from every
 burnt-toast plot. Caught by actually running the real post-fix burnt-toast matrix and
-inspecting the output before trusting it — exactly the discipline the user asked for
-("did you actually solve the problem"). Fixed in `4cf610e`: `split_valid_failed()` now
-keys off `total_iterations > 0` (did the run produce telemetry at all), not
-`error_message` presence. Has a dedicated regression test
-(`test_max_iterations_reached_with_real_telemetry_is_valid_not_failed`).
+inspecting the output before trusting the fix, rather than assuming the patch was
+correct. Fixed in `4cf610e`: `split_valid_failed()` now keys off `total_iterations > 0`
+(did the run produce telemetry at all), not `error_message` presence. Has a dedicated
+regression test (`test_max_iterations_reached_with_real_telemetry_is_valid_not_failed`).
 
 **Lesson for the analyst**: a non-empty `error_message` does NOT always mean the row is
 garbage. Check `total_iterations` — if it's `0`, the row is a crash with no usable data;
 if it's `>0`, the row is real (even if `error_message` notes it hit the iteration cap).
 
-## Validation infrastructure added this session
+## Validation infrastructure added
 
 - `tests/` (46 unit tests total, `python -m unittest discover -s tests`, stdlib only,
   no Ollama needed): `test_hashing.py`, `test_context_seed.py`, `test_memory_tracker.py`,
@@ -103,7 +102,7 @@ if it's `>0`, the row is real (even if `error_message` notes it hit the iteratio
   general "does this harness measure what it claims to" skill (not a one-shot
   fix-verification script), invocable in future sessions.
 
-## Post-fix data collection (this session, 2026-06-21)
+## Post-fix data collection (2026-06-21)
 
 Ran the full matrix (3 models × 5 context sizes × 2 needle positions × 3 strategies =
 90 cells per mode) against the locally running Ollama (models: `qwen2.5:1.5b`,
@@ -137,11 +136,11 @@ Ran the full matrix (3 models × 5 context sizes × 2 needle positions × 3 stra
 
 Early in the needle run, log timestamps showed a ~7-hour gap between one run starting
 and finishing, even though that run's own internal `elapsed` timer showed only ~70s of
-real work. This is almost certainly the sandbox/VM this session runs in being suspended
-while idle between conversation turns, then resumed — not a benchmark bug. Wall-clock
-ETAs given mid-run were unreliable for this reason; the actual recorded metrics
-(`ttft_seconds`, `tokens_per_second`, etc.) are unaffected since they come from Ollama's
-own `prompt_eval_duration`/`eval_duration`, not wall-clock deltas.
+real work. This is almost certainly the development machine being suspended/idle for an
+extended period and then resumed mid-run — not a benchmark bug. Wall-clock ETAs given
+mid-run were unreliable for this reason; the actual recorded metrics (`ttft_seconds`,
+`tokens_per_second`, etc.) are unaffected since they come from Ollama's own
+`prompt_eval_duration`/`eval_duration`, not wall-clock deltas.
 
 ## Known residual limitations (documented, not fixed — out of scope)
 
@@ -156,7 +155,7 @@ own `prompt_eval_duration`/`eval_duration`, not wall-clock deltas.
   `messages` — no Ollama endpoint exposes a dry-run chat token count without a real
   generation call, so this residual is accepted and documented in code rather than
   chased further.
-- `OLLAMA_TIMEOUT_SECONDS` is still the default 600s. Not changed this session since
+- `OLLAMA_TIMEOUT_SECONDS` is still the default 600s. Not changed as part of this audit since
   shortening it wouldn't have produced more data, only failed faster.
 
 ## Files in `results_post_fix_2026-06-21/`
