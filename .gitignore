@@ -37,12 +37,6 @@ results_*.png
 # Auto-generated filler corpus
 burnt_toast/data/filler_corpus.txt
 
-# Article/analysis chart images and self-contained HTML export (regeneratable via
-# article_assets/make_article_charts.py and analysis_assets/make_analysis_charts.py)
-article_assets/*.png
-analysis_assets/*.png
-ARTICLE_for_medium.html
-
 # Environment & secrets
 .env
 .env.*
